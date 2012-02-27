@@ -16,5 +16,5 @@ install: boot_format
 
 clean:
 	rm -rf *.o
-	rm boot_format
+	rm -f boot_format
 
