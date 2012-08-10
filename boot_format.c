@@ -213,7 +213,7 @@ static int parse_dbr(struct boot_sector *dbr)
 		return 0;
 }
 
-static void write_config_file(char *out, int num, struct config_word *pword[])
+static int write_config_file(char *out, int num, struct config_word *pword[])
 {
 	struct stat sb;
 	int h_config, i, n;
@@ -222,9 +222,9 @@ static void write_config_file(char *out, int num, struct config_word *pword[])
 	stat(out, &sb);
 	if ((errno == ENOENT) || S_ISREG(sb.st_mode)) {
 		h_config = open(out, O_WRONLY|O_CREAT|O_TRUNC, 0666);
-		if (h_config == 0) {
+		if (h_config < 0) {
 			printf(MSG_OPEN_FILE_FAIL, out);
-			return;
+			return 1;
 		}
 		for (i = 0; i < num; i++) {
 			n = sprintf(buf, "%02x:%08x\n",
@@ -233,6 +233,7 @@ static void write_config_file(char *out, int num, struct config_word *pword[])
 		}
 		close(h_config);
 	}
+	return 0;
 }
 
 /* FIXME: the 1st line of the config file can't be a blank line */
@@ -432,7 +433,7 @@ int main(int argc, char *argv[])
 		printf("\n\tsize        : reserved space (default 0K).");
 #endif
 		printf("\n");
-		exitcode = -EINVAL;
+		exitcode = EINVAL;
 		goto end;
 	}
 
@@ -452,8 +453,9 @@ int main(int argc, char *argv[])
 		 */
         if (work_mode != 0)
         {
-            printf("\n Only one option is allowed. work_mode: %d \n", work_mode);
-            goto end;
+		exitcode = EINVAL;
+		printf("\n Only one option is allowed. work_mode: %d \n", work_mode);
+		goto end;
         }
 
 		switch (n) {
@@ -473,30 +475,30 @@ int main(int argc, char *argv[])
 	if (((work_mode == BOOT_WORK_MODE_SD) && !S_ISBLK(sb.st_mode)) ||
 	    ((work_mode == BOOT_WORK_MODE_SPI) &&
 			((errno != ENOENT) && !S_ISREG(sb.st_mode)))) {
-		exitcode = -EINVAL;
+		exitcode = EINVAL;
 		goto end;
 	}
 
 	if (work_mode == BOOT_WORK_MODE_SD) {
 		/* Open SD device */
 		h_sd_dev = open(p_devname, O_RDWR, 0666);
-		if (h_sd_dev == 0) {
+		if (h_sd_dev < 0) {
+			exitcode = errno;
 			printf(MSG_OPEN_FILE_FAIL, p_devname);
-			exitcode = -EIO;
 			goto end;
 		}
 
 		/* Read first sector from sd */
 		mbr_buf = (char*)malloc(SEC_TO_BYTE(1));
 		if (mbr_buf == NULL) {
-			exitcode = -ENOMEM;
+			exitcode = errno;
 			goto end;
 		}
 
 		if (read(h_sd_dev, mbr_buf, SEC_TO_BYTE(1))
 				!= SEC_TO_BYTE(1)) {
+			exitcode = errno;
 			printf(MSG_READ_FILE_FAIL, p_devname);
-			exitcode = -EIO;
 			goto end;
 		}
 		debug("Read MBR from SDCard:\n");
@@ -515,13 +517,13 @@ int main(int argc, char *argv[])
 					SEEK_SET);
 			boot_sect_buf = (char*)malloc(SEC_TO_BYTE(1));
 			if (boot_sect_buf == NULL) {
-				exitcode = -ENOMEM;
+				exitcode = errno;
 				goto end;
 			}
 			if (read(h_sd_dev, boot_sect_buf, SEC_TO_BYTE(1)) !=
 					SEC_TO_BYTE(1)) {
+				exitcode = errno;
 				printf(MSG_READ_FILE_FAIL, p_devname);
-				exitcode = -EIO;
 				goto end;
 			}
 			debug("Read DBR from SDCard:\n");
@@ -534,24 +536,24 @@ int main(int argc, char *argv[])
 
 		/* Parse partition. NOTE: mbr_dpt maybe always be NULL */
 		if (parse_dbr(boot_sector) != 0) {
+			exitcode = EINVAL;
 			printf(MSG_SIGNATURE_FAIL);
-			exitcode = -EINVAL;
 			goto end;
 		}
 	} else {
 		h_spi_dev = open(p_devname, O_WRONLY|O_CREAT|O_TRUNC, 0666);
-		if (h_spi_dev == 0) {
+		if (h_spi_dev < 0) {
+			exitcode = errno;
 			printf(MSG_OPEN_FILE_FAIL, p_devname);
-			exitcode = -EIO;
 			goto end;
 		}
 	}
 
 	/* Open config file */
 	h_config = open(p_configname, O_RDONLY);
-	if (h_config == 0) {
+	if (h_config < 0) {
+		exitcode = errno;
 		printf(MSG_OPEN_FILE_FAIL, p_configname);
-		exitcode = -EIO;
 		goto end;
 	}
 
@@ -559,13 +561,13 @@ int main(int argc, char *argv[])
 	lseek(h_config, 0, SEEK_SET);
 	cfg_data_buf = malloc(len);
 	if (cfg_data_buf == NULL) {
-		exitcode = -ENOMEM;
+		exitcode = errno;
 		goto end;
 	}
 
 	if (read(h_config, cfg_data_buf, len) != len) {
+		exitcode = errno;
 		printf(MSG_READ_FILE_FAIL, p_configname);
-		exitcode = -EIO;
 		goto end;
 	}
 
@@ -582,9 +584,9 @@ int main(int argc, char *argv[])
 
 	/* Open user code file */
 	h_usercode = open(p_usercodename, O_RDONLY);
-	if (h_usercode == 0) {
+	if (h_usercode < 0) {
+		exitcode = errno;
 		printf(MSG_OPEN_FILE_FAIL, p_usercodename);
-		exitcode = -EIO;
 		goto end;
 	}
 
@@ -593,12 +595,12 @@ int main(int argc, char *argv[])
 	len = (n + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
 	usercode_buf = malloc(len);
 	if (usercode_buf == NULL) {
-		exitcode = -ENOMEM;
+		exitcode = errno;
 		goto end;
 	}
 	if (read(h_usercode, usercode_buf, n) != n) {
+		exitcode = errno;
 		printf(MSG_READ_FILE_FAIL, p_usercodename);
-		exitcode = -EIO;
 		goto end;
 	}
 
@@ -624,8 +626,8 @@ int main(int argc, char *argv[])
 	}
 
 	if (n == (uint)-1) {
+		exitcode = EINVAL;
 		printf(MSG_PARTLENGTH_FAIL);
-		exitcode = -EINVAL;
 		goto end;
 	}
 
@@ -645,8 +647,11 @@ int main(int argc, char *argv[])
 		while((opt = getopt_long_only(argc, argv, "", longopts, NULL))
 			!= -1) {
 			if (opt == 'o')
-				write_config_file(optarg, config_num,
-						pconfig_word);
+				if (write_config_file(optarg, config_num,
+						      pconfig_word)) {
+					exitcode = errno;
+					goto end;
+				}
 		}
 	}
 
@@ -679,8 +684,8 @@ int main(int argc, char *argv[])
 	while (len > 0) {
 		n = write(h_dev, ptr, len);
 		if (n < 0) {
+			exitcode = errno;
 			printf(MSG_WRITE_FILE_FAIL, p_devname);
-			exitcode = -EIO;
 			goto end;
 		}
 		ptr += n;
@@ -725,8 +730,8 @@ int main(int argc, char *argv[])
 			while (len > 0) {
 				n = write(h_dev, ptr, len);
 				if (n < 0) {
+					exitcode = errno;
 					printf(MSG_WRITE_FILE_FAIL, p_devname);
-					exitcode = -EIO;
 				}
 				ptr += n;
 				len -= n;
@@ -748,8 +753,8 @@ int main(int argc, char *argv[])
 			while (len > 0) {
 				n = write(h_dev, ptr, len);
 				if (n < 0) {
+					exitcode = errno;
 					printf(MSG_WRITE_FILE_FAIL, p_devname);
-					exitcode = -EIO;
 				}
 				ptr += n;
 				len -= n;
@@ -774,8 +779,8 @@ int main(int argc, char *argv[])
 			ptr = (uchar *)sector;
 			n = write(h_dev, ptr, len);
 			if (n < 0) {
+				exitcode = errno;
 				printf(MSG_WRITE_FILE_FAIL, p_devname);
-				exitcode = -EIO;
 			}
 			ptr += n;
 			len -= n;
@@ -800,8 +805,11 @@ end:
 	if (h_spi_dev != 0)
 		close(h_spi_dev);
 
-	if (exitcode == 0)
+	if (exitcode == 0) {
 		printf("Congratulations! It is done successfully.\n");
+		return EXIT_SUCCESS;
+	}
 
-	return exitcode;
+	printf("Error happened while execution: %s\n", strerror(exitcode));
+	return EXIT_FAILURE;
 }
