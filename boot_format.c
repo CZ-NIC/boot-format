@@ -40,11 +40,15 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <errno.h>
+#include <linux/hdreg.h>
+#include <sys/ioctl.h>
 #include "boot_format.h"
 
 /*
@@ -86,14 +90,14 @@ static void print_mbr(struct mbr_disk_part_tbl *mbr_dpt)
 {
 #ifdef DEBUG
 	debug("\n================== MBR ==================\n");
-	debug("boot_ind		= 0x%x\n", mbr_dpt->boot_ind);
-	debug("start_head	= 0x%x\n", mbr_dpt->start_head);
-	debug("start_cylesec	= 0x%x\n", mbr_dpt->start_cylsec);
-	debug("part_type	= 0x%x\n", mbr_dpt->part_type);
-	debug("end_head		= 0x%x\n", mbr_dpt->end_head);
-	debug("end_cylsec	= 0x%x\n", mbr_dpt->end_cylsec);
-	debug("rel_sectors	= 0x%x\n", mbr_dpt->rel_sectors);
-	debug("total_sectors	= 0x%x\n", mbr_dpt->total_sectors);
+	debug("boot_ind         = 0x%x\n", mbr_dpt->boot_ind);
+	debug("start_head       = 0x%x\n", mbr_dpt->start_head);
+	debug("start_cylesec    = 0x%x\n", mbr_dpt->start_cylsec);
+	debug("part_type        = 0x%x\n", mbr_dpt->part_type);
+	debug("end_head         = 0x%x\n", mbr_dpt->end_head);
+	debug("end_cylsec       = 0x%x\n", mbr_dpt->end_cylsec);
+	debug("rel_sectors      = 0x%x\n", mbr_dpt->rel_sectors);
+	debug("total_sectors    = 0x%x\n", mbr_dpt->total_sectors);
 	debug("=========================================\n");
 #endif
 }
@@ -102,13 +106,13 @@ static void print_dbr(struct boot_sector *dbr)
 {
 #ifdef DEBUG
 	debug("\n================== DBR ==================\n");
-	debug("jmp_code[0]	= 0x%x\n", dbr->jmp_code[0]);
+	debug("jmp_code[0]      = 0x%x\n", dbr->jmp_code[0]);
 
 	debug("\n");
-	debug("sector_size	= 0x%x\n", dbr->bpb.sector_size);
-	debug("root_entries	= 0x%x\n", dbr->bpb.root_entries);
-	debug("small_sector	= 0x%x\n", dbr->bpb.small_sectors);
-	debug("sectors_p_fat	= 0x%x\n", dbr->bpb.sectors_p_fat);
+	debug("sector_size      = 0x%x\n", dbr->bpb.sector_size);
+	debug("root_entries     = 0x%x\n", dbr->bpb.root_entries);
+	debug("small_sector     = 0x%x\n", dbr->bpb.small_sectors);
+	debug("sectors_p_fat    = 0x%x\n", dbr->bpb.sectors_p_fat);
 	debug("=========================================\n");
 #endif
 }
@@ -125,10 +129,14 @@ static uint get_endian_mode(void)
 
 static void swap_mbr(struct mbr_disk_part_tbl *mbr_dpt)
 {
-	mbr_dpt->start_cylsec = SWAP16(mbr_dpt->start_cylsec);
-	mbr_dpt->end_cylsec = SWAP16(mbr_dpt->end_cylsec);
-	mbr_dpt->rel_sectors = SWAP32(mbr_dpt->rel_sectors);
-	mbr_dpt->total_sectors = SWAP32(mbr_dpt->total_sectors);
+	int i;
+	
+	for (i = 0; i < 4; i++) {
+		mbr_dpt->start_cylsec = SWAP16(mbr_dpt->start_cylsec);
+		mbr_dpt->end_cylsec = SWAP16(mbr_dpt->end_cylsec);
+		mbr_dpt->rel_sectors = SWAP32(mbr_dpt->rel_sectors);
+		mbr_dpt->total_sectors = SWAP32(mbr_dpt->total_sectors);
+	}
 }
 
 static void swap_dbr(struct boot_sector *dbr)
@@ -168,99 +176,239 @@ static inline ushort back_to_cylsec(ushort sec, ushort cyl)
     return ((sec & 0x3F) || ((cyl & 0x300)>> 2) || ((cyl & 0xFF)<<8));
 }
 
-/* NOTE: some formatted card hasn't MBR, only DBR */
-static void parse_mbr(char *sd_data, struct mbr_disk_part_tbl **mbr)
+
+static bool get_disk_geometry(int fd, struct hd_geometry *geometry)
 {
-	ushort cylsec, start_cyl;
-	uchar start_sec;
-	struct mbr_disk_part_tbl *mbr_dpt;
+	bool success = true;
 
-    mbr_dpt = (struct mbr_disk_part_tbl *)(sd_data + MBR_DPT_OFF); //Partition Table
-	if (get_endian_mode() == BIG_ENDIAN_MODE)
-		swap_mbr(mbr_dpt);
-	print_mbr(mbr_dpt);
-
-	/* Check if it is a MBR */
-	cylsec = mbr_dpt->start_cylsec;
-	start_sec = cylsec_to_sec(cylsec);
-	start_cyl = cylsec_to_cyl(cylsec);
-
-	if (mbr_dpt->part_type == 0 ||
-	    (mbr_dpt->boot_ind != 0 && mbr_dpt->boot_ind != 0x80) ||
-/*-----------------8/12/2010 10:28AM----------------
- * The start head does not necessary to be the 1st
- * --------------------------------------------------*/
-//       mbr_dpt->start_head != 1 ||
-//       start_sec != 1 ||
-//       start_cyl != 0 ||
-	    mbr_dpt->end_head < mbr_dpt->start_head ||
-	    mbr_dpt->total_sectors < mbr_dpt->rel_sectors) {
-		*mbr = NULL;
-		debug("It is not a valid MBR.\n");
-	} else {
-		*mbr = mbr_dpt;
-		debug("It is a valid MBR\n");
+	if (ioctl(fd, HDIO_GETGEO, geometry)) {
+		// Fall back to reasonable defaults for modern systems
+		geometry->heads = 255;
+		geometry->sectors = 63;
 	}
+
+	debug("Using disk geometry of %u heads and %u sectors/track for CHS translation\n", geometry->heads, geometry->sectors);
+
+	return (success);
 }
 
-static int parse_dbr(struct boot_sector *dbr)
+static bool chs2lba(int fd, const struct hd_geometry *geometry, uint c, uint h, uint s, uint *sector)
 {
+	bool success = false;
+
+	// Finding the first sector of a partition is less easy than it looks.
+	// Technically, we have to start with CHS and only use the LBA entry
+	// if CHS doesn't work. This is a little bit annoying.
+	if((h == 0xff) || (s == 0)) {
+		// As this CHS value is effectively invalid, it is
+		// our indication to keep using the LBA value that may have
+		// been preset in the sectors variable by the caller
+		success = false;
+	} else {
+		// Now we use CHS!
+		*sector = (c * geometry->heads + h) * geometry->sectors + (s - 1);
+		success = true;
+	}
+
+
+	return(success);
+}
+
+static void first_last_partition_on_disk(int fd, const struct hd_geometry *geometry, struct mbr_disk_part_tbl *dbr, struct mbr_disk_part_tbl **first_partition, struct mbr_disk_part_tbl **last_partition)
+{
+	uint first_s = 0xffffffff, last_s = 0, c, h, s;
+	int i;
+
+	*first_partition = NULL;
+	*last_partition= NULL;
+	
+	// Find the physically first partition on disk, which might not be the
+	// first entry!
+	if(dbr) {
+		for(i = 0; i < 4; ++i) {
+			if ((dbr[i].part_type != 0) &&
+			    ((dbr[i].boot_ind & 0x7f) == 0) &&
+			    (dbr[i].total_sectors)) {
+				uint lbasec = dbr->rel_sectors;
+
+				// if CHS is valid, we have to override!
+				c = cylsec_to_cyl(dbr->start_cylsec);
+				h = dbr->start_head;
+				s = cylsec_to_sec(dbr->start_cylsec);
+				if(chs2lba(fd, geometry, c, h, s, &lbasec)) {
+					// The following is a bit of a hack.
+					// We fill in the LBA value to make
+					// sure subsequent code can use it.
+					if(dbr->rel_sectors != lbasec)
+						printf("WARNING! CHS geometry for partition points to sector %u while LBA entry in MBR points to %u. Updated LBA value with CHS value!\n", lbasec, dbr->rel_sectors);
+					dbr->rel_sectors = lbasec;
+
+				}
+
+				if(lbasec < first_s) {
+					*first_partition = &dbr[i];
+					first_s = lbasec;
+				}
+
+				// Now check the partition end
+				lbasec = dbr->rel_sectors + dbr->total_sectors - 1;
+
+				// if CHS is valid, we have to override!
+				c = cylsec_to_cyl(dbr->end_cylsec);
+				h = dbr->start_head;
+				s = cylsec_to_sec(dbr->end_cylsec);
+				chs2lba(fd, geometry, c, h, s, &lbasec);
+
+				if(lbasec > last_s) {
+					*last_partition = &dbr[i];
+					last_s = lbasec;
+				}
+			}
+		}
+	}
+
+}
+
+/* NOTE: some formatted card hasn't MBR, only DBR */
+static struct mbr_disk_part_tbl *parse_mbr(uchar *sd_data)
+{
+	struct mbr_disk_part_tbl *mbr_dpt = NULL;
+
+	if ((sd_data[MBRDBR_BOOT_SIG_55] == 0x55) &&
+	    (sd_data[MBRDBR_BOOT_SIG_AA] == 0xAA)) {
+		int i;
+
+		mbr_dpt = (struct mbr_disk_part_tbl *)(sd_data + MBR_DPT_OFF); //Partition Table
+
+		/* Check the partition table. If it is obviously invalid,
+		 * we don't have a good MBR */
+		for (i = 0; i < 4; i++) {
+			if ((mbr_dpt[i].part_type != 0) &&
+			    ((mbr_dpt[i].boot_ind != 0 && mbr_dpt[i].boot_ind != 0x80) ||
+			     (!mbr_dpt[i].total_sectors))) {
+				mbr_dpt = NULL;
+				break;
+			}
+		}
+	}
+		
+	debug((mbr_dpt) ? "It is a valid MBR\n" : "It is not a valid MBR\n");
+
+	return(mbr_dpt);
+
+}
+
+static bool is_fat_partition(struct mbr_disk_part_tbl *mbr_dpt)
+{
+	if (mbr_dpt) {
+		/* We only know about FAT partitions, so we ignore all other types */
+		if ((mbr_dpt->part_type == 0x01) ||
+		    (mbr_dpt->part_type == 0x04) ||
+		    (mbr_dpt->part_type == 0x06) ||
+		    // Special LBA mapped Win 95 types
+		    (mbr_dpt->part_type == 0x0B) ||
+		    (mbr_dpt->part_type == 0x0C) ||
+		    (mbr_dpt->part_type == 0x0E) ||
+		    (mbr_dpt->part_type == 0x0F) ||
+		    // Logical sectored FAT types, very unusual but technically valid
+		    (mbr_dpt->part_type == 0x08) ||
+		    (mbr_dpt->part_type == 0x11) ||
+		    (mbr_dpt->part_type == 0x14) ||
+		    (mbr_dpt->part_type == 0x24) ||
+		    (mbr_dpt->part_type == 0x56) ||
+		    (mbr_dpt->part_type == 0xe5) ||
+		    (mbr_dpt->part_type == 0xf2))
+			return(true);
+	}
+
+	return(false);
+}
+
+static struct boot_sector *parse_dbr(struct mbr_disk_part_tbl *mbr_dpt, uchar *boot_sect_buf)
+{
+	struct boot_sector *dbr = (struct boot_sector *)boot_sect_buf;
+
 	print_dbr(dbr);
 
-	if (dbr->jmp_code[0] != 0xEB || dbr->bpb.sector_size != SECTOR_SIZE)
-		return 1;
-	else
-		return 0;
+	if (mbr_dpt) {
+		/* We only know about FAT partitions, so we ignore all other types */
+		if(!is_fat_partition(mbr_dpt))
+			dbr = NULL;
+	}
+	
+	if (dbr) {
+		if ((boot_sect_buf[MBRDBR_BOOT_SIG_55] != 0x55) ||
+		    (boot_sect_buf[MBRDBR_BOOT_SIG_AA] != 0xAA) ||
+		    (dbr->jmp_code[0] != 0xEB) ||
+		    (dbr->bpb.sector_size != SECTOR_SIZE)) {
+			dbr = NULL;
+		}
+	}
+
+	debug((dbr) ? "It is a valid DBR\n" : "It is not a valid DBR\n");
+
+	return dbr;
 }
 
 static int write_config_file(char *out, int num, struct config_word *pword[])
 {
 	struct stat sb;
 	int h_config, i, n;
-	char buf[20];
+	char buf[20], *format;
 
 	stat(out, &sb);
 	if ((errno == ENOENT) || S_ISREG(sb.st_mode)) {
 		h_config = open(out, O_WRONLY|O_CREAT|O_TRUNC, 0666);
 		if (h_config < 0) {
 			printf(MSG_OPEN_FILE_FAIL, out);
-			return 1;
+			return errno;
 		}
+		format = "%02x:%08x\n"; /* Backwards compatibility */
 		for (i = 0; i < num; i++) {
-			n = sprintf(buf, "%02x:%08x\n",
+			if (pword[i]->off >= 0x100) {
+				format = "%04x:%08x\n";
+				break;
+			}
+		}
+		
+		for (i = 0; i < num; i++) {
+			n = sprintf(buf, format,
 					pword[i]->off, pword[i]->val);
-			write(h_config, buf, n);
+			if(write(h_config, buf, n) < 0)
+				return errno;
 		}
 		close(h_config);
 	}
+
 	return 0;
+
 }
 
-/* FIXME: the 1st line of the config file can't be a blank line */
-static int parse_config_file(char *config_data, int config_len,
+
+static int parse_config_file(const char *p_configname, char *config_data, int config_len,
 			struct config_word *word[])
 {
 	int i = 0, newline = 1;
 	char *tmp = config_data;
 
 	while (tmp < (config_data + config_len)) {
-		if (newline == 1) {
+		if (isspace(*tmp) && !isblank(*tmp)) {
+			*tmp++ = '\0';
+			newline = 1;
+			continue;
+		}
+
+		if (newline) {
 			word[i++] = (struct config_word *)tmp;
 			newline = 0;
 		}
-
-		if ((*tmp == RET_FLG1) || (*tmp == RET_FLG2)) {
-			do {
-				*tmp++ = '\0';
-			} while ((*tmp == RET_FLG1) || (*tmp == RET_FLG2));
-
-			newline = 1;
-		} else
-			tmp++;
+		tmp++;
 
 		/* if overflow, just ignore left data */
-		if (i >= BOOT_MAX_CONFIG_WORDS)
+		if (i >= BOOT_MAX_CONFIG_WORDS) {
+			printf("WARNING! Too many configuration words!\n");
 			break;
+		}
 	}
 
 	config_len = i;
@@ -268,6 +416,10 @@ static int parse_config_file(char *config_data, int config_len,
 		config_data = (char *)word[i];
 		tmp = config_data;
 		word[i] = malloc(sizeof(struct config_word));
+		if(!word[i]) {
+			printf(MSG_MEMALLOC_FAIL, p_configname);
+			break;
+		}
 
 		while (*tmp++ != DELIMITER) ;
 			*(tmp - 1) = '\0';
@@ -283,7 +435,7 @@ static int parse_config_file(char *config_data, int config_len,
  * NOTE: partition can't cross cylinder
  * sectors per cylinder = heads * (sectors per track)
  * though heads can be 256, but because of limits of address registers in ASM,
- * heads offten is 255.
+ * heads often is 255.
  * e.g. if heads = 255, sectors per track = 63
  * sectors per cylinder = 16065(255 * 63)
  *
@@ -292,121 +444,251 @@ static int parse_config_file(char *config_data, int config_len,
  * if left space in the 1st partition is enough to save user code, that's
  * perfect, or related items in MBR/DBR tables must be fixed to exclude
  * the space that is used by user code
- * return: 0 -- normal capacity
- *         1 -- high capacity
- *         negtive -- error
+ * return: all ones -- error
  */
-static uint adjust_partition_table(struct mbr_disk_part_tbl *mbr, struct boot_sector *pdbr,
-		int sectors, int *high_cap)
+static uint adjust_partition_table(const struct hd_geometry *geometry, const uint sd_sectors,
+				   struct mbr_disk_part_tbl *mbr, struct mbr_disk_part_tbl *mbr_last,
+				   struct boot_sector *pdbr,
+				   const uint n, const int sectors)
 {
-    uint cyl_secs, left_sec, total_sec, hidden_sec, extra, bu;
-    ushort start_sec, start_cyl;
-    int off, shrink_secs, i;
+	uint cyl_secs, total_sec;
+	int off, shrink_secs;
 
-	cyl_secs = pdbr->bpb.sector_p_track * pdbr->bpb.heads;
-	total_sec = pdbr->bpb.small_sectors;
-	if (total_sec == 0) /* partitions > 32M */
-		total_sec = pdbr->bpb.large_sectors;
-	hidden_sec = pdbr->bpb.hidden_sectors;
+	// If this gets called without MBR and without partition info,
+	// we just pretend to be unpartitioned
+	if(!mbr && !pdbr)
+		return n;
+	
+	// If our user code fits into the space prior to the first partition,
+	// we are ok. Things can remain "as is" in this case
+	if(mbr && (n + sectors <= mbr->rel_sectors))
+		return n;
 
-	/* check whether 1st partition is enough big, maybe not needed */
-	if (total_sec < sectors)
+	// FAT supports other sizes than 512, but the code below does not!
+	if(pdbr) {
+		debug("Checking FAT boot record\n");
+		if(pdbr->bpb.sector_size != 512)
+			goto bad;
+
+		// DOS 3 extension. We are not falling back to the HW reported geometry,
+		// but try to stick with what the partitioning tool told us!
+		if((pdbr->bpb.sector_p_track != geometry->sectors) ||
+		(pdbr->bpb.heads != geometry->heads)) {
+			printf("WARNING! CHS geometry in FAT boot block does not match reported disk geometry. Using disk geometry instead!\n");
+		}
+
+		total_sec = pdbr->bpb.small_sectors;
+		if (total_sec == 0) /* partitions > 32M */
+			total_sec = pdbr->bpb.large_sectors;
+
+		if(!total_sec && mbr)
+			total_sec = mbr->total_sectors;
+	} else {
+		debug("Reading partition size from MBR\n");
+		total_sec = mbr->total_sectors;
+	}
+
+	debug("Calculating cylinder geometry for CHS rounding\n");
+	cyl_secs = geometry->sectors * geometry->heads;
+	if(!cyl_secs)
 		goto bad;
 
-	/*
-	 * whether the card is a high capacity card. The judge standard
-	 * is the capacity whether or not is more than 2G
-     * JZ: For card less than 2GB, the data will pending on the end of the partition
-     *     For card > 2GB, need to put at the ahead of the Boot sector
-     *     Therefore, the start head, cylinder/sec need to be changed
-     *     However, the ending head & cylinder/sec is the same
-	 */
-    if (total_sec / ( 2 * 1024) > 2048) {  // (2 GB < Partition <= 32 GB)
-		*high_cap = 1;
-        off = 9; //Set to 9 See Figure 4-2 of File System Spec.
-        bu = FAT32_BOUNDARYUNIT;
-/*        if (total_sec / ( 2 * 1024) > 32768) {    // (32 GB < Partition < 2 TB)
-           *high_cap = 2;
-           off = 24; //Set to 24 See Figure 5-2 of File System Spec.
-           bu = EXFAT_BOUNDARYUNIT;
-        }
- */
-        sectors += off;
-        if (hidden_sec < sectors) {
-            for ( i = 1; i< 32; i++) {
-                if (sectors < i*bu)   //Need to keep BU
-                   break;
-            }
-            if (i == 32) //boot image is too large. The limit size is 128 MB ( 1 byte)
-                 goto bad;
-            hidden_sec = i*bu;
-            extra = hidden_sec - mbr->rel_sectors;
-            debug("new/old hidden_sec %d/%d, difference %d, rel_sectors %d",
-                   hidden_sec, pdbr->bpb.hidden_sectors, extra, mbr->rel_sectors );
-            start_sec = (hidden_sec % pdbr->bpb.sector_p_track ) + 1;
-            start_cyl = hidden_sec / cyl_secs;
-            mbr->start_head = (uchar) (hidden_sec % cyl_secs)/ pdbr->bpb.sector_p_track;
-            mbr->start_cylsec = back_to_cylsec (start_sec, start_cyl);
-            mbr->rel_sectors = hidden_sec;
-            mbr->total_sectors = total_sec - extra;
-            debug("start_secotr %d, start_cyl %d, cylsec %x, start_head %d",
-                   start_sec, start_cyl, mbr->start_cylsec, mbr->start_head);
+	/* check whether 1st partition is enough big, maybe not needed */
+	debug("SD sectors %u, 1st partition total_sec %u, needed sectors %u\n", sd_sectors, total_sec, sectors);
 
-            pdbr->bpb.hidden_sectors = hidden_sec;
+	// Let's see if we can put the code beyond the last partition
+	// We check beyond the last sector of the last partition and round it up
+	// to the next "cylinder" boundary just to keep partition tools happy
+	// that might interfere with the interim space if partitions are modified
+	// after placing the user code
+	if(mbr) {
+		off = mbr_last->rel_sectors + mbr_last->total_sectors;
+	} else {
+		off = total_sec;
+	}
+	if(sd_sectors < off)
+		goto bad;
+	off = ((off + cyl_secs - 1) / cyl_secs) * cyl_secs;
+	if(sd_sectors <= off)
+		goto bad;
 
-        }
+	debug("Checking if we need to shrink the partition at all\n");
+	if(sd_sectors - off >= sectors)
+		goto end;
 
-    }
-    else {              //partition <= 2 GB
-        *high_cap = 0;
+	debug("Shrinking seems necessary\n");
+	// We are only shrinking the partition if it is the only
+	// one, i.e., last == first. Reason is purely that this code
+	// carries so much history that keeping the context to correctly
+	// modify the last partition would be a hideous rewrite.
+	if(mbr && (mbr != mbr_last))
+		goto bad;
 
-        /* check left sectors whether to save user code */
-        left_sec = (total_sec + hidden_sec) % cyl_secs;
-        off = total_sec + hidden_sec - left_sec;
-        shrink_secs = sectors - left_sec;
+	// We again round up to the number of cylinders to make sure that
+	// partitioning tools don't complain too much.
+	shrink_secs = sectors - (sd_sectors - off);
+	shrink_secs = ((shrink_secs + cyl_secs - 1) / cyl_secs) * cyl_secs;
 
-        /*
-         * if shrink_secs <= 0, which means left space is enough large to
-         * save the user code + reserved space
-         */
-        if (shrink_secs <= 0)
-            goto end;
 
-        /* don't worry about the problem that crosses the cylinder */
-        total_sec -= shrink_secs;
-        off -= shrink_secs;
+	total_sec -= shrink_secs;
+	off -= shrink_secs;
 
-        if (pdbr->bpb.small_sectors == 0)
-            pdbr->bpb.large_sectors = total_sec;
-        else
-            pdbr->bpb.small_sectors = total_sec;
-    }
+	if (pdbr) {
+		if (pdbr->bpb.small_sectors == 0)
+			pdbr->bpb.large_sectors = total_sec;
+		else
+			pdbr->bpb.small_sectors = total_sec;
+	}
 
-    if (mbr != NULL)
-        mbr->total_sectors = total_sec;
+	if (mbr)
+		mbr->total_sectors = total_sec;
 
+	debug("Shrinked FAT partition by %u sectors to put user code image beyond the end\n", shrink_secs);
+	printf("WARNING! First FAT partition has been adjusted in size! You MUST reformat that partition!\n");
 end:
 	return off;
 bad:
 	return (uint)-1;
 }
 
+static uint writebuffer(int h_dev, uchar *ptr, uint len)
+{
+	int n;
+
+	while (len > 0) {
+		n = (len >= 1<<30) ? 1<<30 : len;
+		n = write(h_dev, ptr, n);
+		if (n < 0) {
+			break;
+		}
+		ptr += n;
+		len -= n;
+	}
+
+	/* If this is not zero, we had an error! */
+	return(len);
+}
+
+static bool read_sector(const int fd, const uint sector, uchar *buffer)
+{
+	bool success = false;
+
+	if(lseek64(fd, SEC_TO_BYTE_OFFSET(sector), SEEK_SET) >= 0) {
+		if (read(fd, buffer, SEC_TO_BYTE(1)) == SEC_TO_BYTE(1)) {
+			success = true;
+		}
+	}
+
+	return(success);
+}
+
+static bool write_sector(const int fd, const uint sector, uchar *buffer)
+{
+	bool success = false;
+
+	if(lseek64(fd, SEC_TO_BYTE_OFFSET(sector), SEEK_SET) >= 0) {
+		if (writebuffer(fd, buffer, SEC_TO_BYTE(1)) == 0) {
+			success = true;
+		}
+	}
+
+	return(success);
+}
+
+static int read_config_file(char *p_configname, struct config_word **pconfig_word, uint *p_config_num)
+{
+	char *cfg_data_buf;
+	int exitcode = 0;
+	int h_config;
+	uint len;
+
+	h_config = open(p_configname, O_RDONLY);
+	if (h_config >= 0) {
+		len = lseek(h_config, 0, SEEK_END);
+		lseek(h_config, 0, SEEK_SET);
+		cfg_data_buf = malloc(len + 1);
+		if (cfg_data_buf) {
+			cfg_data_buf[len] = 0; /* Ensure termination when parsing last line */
+			if (read(h_config, cfg_data_buf, len) == len) {
+				/* Parse config file */
+				*p_config_num = parse_config_file(p_configname, cfg_data_buf, len, pconfig_word);
+			} else {
+				exitcode = errno;
+				printf(MSG_READ_FILE_FAIL, p_configname);
+			}
+
+			free(cfg_data_buf);
+		} else {
+			exitcode = errno;
+			printf(MSG_MEMALLOC_FAIL, p_configname);
+		}
+		
+		close(h_config);
+	} else {
+		exitcode = errno;
+		printf(MSG_OPEN_FILE_FAIL, p_configname);
+	}
+
+	return exitcode;
+}
+
+static int read_usercode_file(char *p_usercodename, char **p_usercode_buf, uint *p_len)
+{
+	int exitcode = 0;
+	int h_usercode;
+	int n;
+	uint len;
+	char *usercode_buf;
+	
+	h_usercode = open(p_usercodename, O_RDONLY);
+	if (h_usercode >= 0) {
+		n = lseek(h_usercode, 0, SEEK_END);
+		lseek(h_usercode, 0, SEEK_SET);
+		len = BYTE_ROUNDUP_TO_SEC(n);
+		usercode_buf = malloc(len);
+		if (usercode_buf) {
+			memset(usercode_buf + n, 0, len - n);
+			if (read(h_usercode, usercode_buf, n) == n) {
+				*p_usercode_buf = usercode_buf;
+				*p_len = len;
+			} else {
+				exitcode = errno;
+				printf(MSG_READ_FILE_FAIL, p_usercodename);
+				free(usercode_buf);
+			}
+		} else {
+			exitcode = errno;
+			printf(MSG_MEMALLOC_FAIL, p_usercodename);
+		}
+			
+		close(h_usercode);
+	} else {
+		exitcode = errno;
+		printf(MSG_OPEN_FILE_FAIL, p_usercodename);
+	}
+
+	return exitcode;
+}
+
 int main(int argc, char *argv[])
 {
-	int h_dev, h_spi_dev = 0, h_sd_dev = 0, h_config = 0, h_usercode = 0;
-	char *cfg_data_buf = NULL, *usercode_buf = NULL;
-	char *mbr_buf = NULL, *boot_sect_buf = NULL;
-	char p_configname[256], p_usercodename[256], p_devname[256];
-	struct mbr_disk_part_tbl *mbr_dpt = NULL;
+	int h_dev, h_spi_dev = 0, h_sd_dev = 0;
+	char *usercode_buf = NULL;
+	uchar *mbr_buf = NULL, *boot_sect_buf = NULL;
+	char p_configname[256], p_usercodename[256], p_devname[256], p_outconfigname[256];
+	struct mbr_disk_part_tbl *mbr_dpt_base, *mbr_dpt = NULL, *mbr_dpt_last = NULL;
 	struct boot_sector *boot_sector = NULL;
 	struct config_word *pconfig_word[BOOT_MAX_CONFIG_WORDS];
-	int exitcode = 0, h_cap, code_addr = 0, work_mode = 0;
-	uint i, n, config_num = 0, len, sec_user, rev_space = BOOT_REV_SPACE;
+	int exitcode = 0, code_addr = -1, work_mode = 0;
+	uint i, n, config_num, len, sec_user, rev_space = BOOT_REV_SPACE;
 	uchar *ptr = NULL;
 	struct stat sb;
-	int opt = 0;
 	uint endian_mode;
 	uint rel_sectors = 0;
+	uint offmin = 0xffffffff, offmax = 0;
+	off64_t sd_sectors = 0;
+	bool pblboot;
+	struct hd_geometry geometry;
 	struct option longopts[] = {
 		{"sd", required_argument, NULL, 'd'},
 		{"spi", required_argument, NULL, 'p'},
@@ -416,12 +698,12 @@ int main(int argc, char *argv[])
 	};
 
 	memset(pconfig_word, 0, sizeof(struct config_word *) *
-			BOOT_MAX_CONFIG_WORDS);
+	       BOOT_MAX_CONFIG_WORDS);
 	if (argc < 5) {
-		printf("Usage: %s config_file image -sd dev [-o out_config]"
-			" | -spi spiimage", argv[0]);
+		printf("Usage: %s <config_file> <image> -sd <dev> [-o <out_config>]"
+			" | -spi <spiimage>", argv[0]);
 #if CONFIG_REV_SPACE
-		printf(" [-r size]");
+		printf(" [-r <size>]");
 #endif
 		printf("\n");
 		printf("\n\tconfig_file : includes boot signature and config words");
@@ -430,7 +712,7 @@ int main(int argc, char *argv[])
 		printf("\n\tspiimage    : boot image for SPI mode");
 		printf("\n\tout_config  : modified config file for SD mode");
 #if CONFIG_REV_SPACE
-		printf("\n\tsize        : reserved space (default 0K).");
+		printf("\n\tsize        : reserved space in KiB (default 0KiB).");
 #endif
 		printf("\n");
 		exitcode = EINVAL;
@@ -439,42 +721,60 @@ int main(int argc, char *argv[])
 
 	/* Endian mode */
 	endian_mode = get_endian_mode();
-	debug("It is a %s endian machine.\n",
+	debug("This host is a %s endian machine.\n",
 			endian_mode == BIG_ENDIAN_MODE ? "big" : "little");
 
 	memset(p_devname, 0, sizeof(p_devname));
 	strncpy(p_configname, argv[1], 255);
 	strncpy(p_usercodename, argv[2], 255);
+	p_outconfigname[0] = 0;
 	while((n = getopt_long_only(argc, argv, "", longopts, NULL)) != -1) {
+		int new_work_mode = 0;
+
+		switch (n) {
+			case 'd':
+				new_work_mode = BOOT_WORK_MODE_SD;
+				strncpy(p_devname, optarg, 255);
+				break;
+			case 'p':
+				new_work_mode = BOOT_WORK_MODE_SPI;
+				strncpy(p_devname, optarg, 255);
+				break;
+			case 'o':
+				strncpy(p_outconfigname, optarg, 255);
+				break;
+#if CONFIG_REV_SPACE
+			case 'r':
+				rev_space = strtoul(optarg, (char**)NULL, 10) * 1024;
+				break;
+#endif
+		}
+
 		/*
 		 * if "sd" and "spi" flags are used together,
 		 * work_mode must be wrong !
-         * JZ: added print information for more than 1 option
+	         * JZ: added print information for more than 1 option
 		 */
-        if (work_mode != 0)
-        {
-		exitcode = EINVAL;
-		printf("\n Only one option is allowed. work_mode: %d \n", work_mode);
-		goto end;
-        }
+	        if (new_work_mode && work_mode) {
+        	    printf("\n Only one option is allowed. work_mode: %d \n", work_mode);
+		    exitcode = EINVAL;
+	            goto end;
+        	}
+		work_mode |= new_work_mode;
 
-		switch (n) {
-		case 'd':
-            work_mode |= BOOT_WORK_MODE_SD;
-			strncpy(p_devname, optarg, 255);
-			break;
-		case 'p':
-            work_mode |= BOOT_WORK_MODE_SPI;
-			strncpy(p_devname, optarg, 255);
-			break;
-		}
 	}
 
 	memset(&sb, 0, sizeof(struct stat));
 	stat(p_devname, &sb);
-	if (((work_mode == BOOT_WORK_MODE_SD) && !S_ISBLK(sb.st_mode)) ||
-	    ((work_mode == BOOT_WORK_MODE_SPI) &&
-			((errno != ENOENT) && !S_ISREG(sb.st_mode)))) {
+	if ((work_mode == BOOT_WORK_MODE_SD) && !S_ISBLK(sb.st_mode)) {
+		printf("Specified SDCard device node is not a block device!\n");
+		exitcode = EINVAL;
+		goto end;
+	}
+
+	if ((work_mode == BOOT_WORK_MODE_SPI) &&
+			((errno != ENOENT) && !S_ISREG(sb.st_mode))) {
+		printf("Specified SPI image name is not a regular file name!\n");
 		exitcode = EINVAL;
 		goto end;
 	}
@@ -488,15 +788,31 @@ int main(int argc, char *argv[])
 			goto end;
 		}
 
+		// Obtain disk geometry for CHS conversions
+		if(!get_disk_geometry(h_sd_dev, &geometry)) {
+			printf(MSG_GEOMETRY_FAIL, p_devname);
+			exitcode = -EIO;
+			goto end;
+		}
+
 		/* Read first sector from sd */
-		mbr_buf = (char*)malloc(SEC_TO_BYTE(1));
+		mbr_buf = (uchar*)malloc(SEC_TO_BYTE(1));
 		if (mbr_buf == NULL) {
 			exitcode = errno;
 			goto end;
 		}
 
-		if (read(h_sd_dev, mbr_buf, SEC_TO_BYTE(1))
-				!= SEC_TO_BYTE(1)) {
+		/* Determine size of disk to understand SD vs. SDHC */
+		sd_sectors = lseek64(h_sd_dev, 0, SEEK_END);
+		if(sd_sectors < 0) {
+			exitcode = errno;
+			printf(MSG_READ_FILE_FAIL, p_devname);
+			goto end;
+		}
+		sd_sectors = BYTE_TO_SEC(BYTE_ROUNDUP_TO_SEC(sd_sectors));
+		debug("SDCard has %u sectors\n", (uint)sd_sectors);
+
+		if(!read_sector(h_sd_dev, 0, mbr_buf)) {
 			exitcode = errno;
 			printf(MSG_READ_FILE_FAIL, p_devname);
 			goto end;
@@ -504,41 +820,58 @@ int main(int argc, char *argv[])
 		debug("Read MBR from SDCard:\n");
 		print_buf(mbr_buf, SEC_TO_BYTE(1), 1);
 
-		parse_mbr(mbr_buf, &mbr_dpt);
-		rel_sectors = mbr_dpt->rel_sectors;
+		if (get_endian_mode() == BIG_ENDIAN_MODE)
+			swap_mbr((struct mbr_disk_part_tbl *)mbr_buf);
 
-		/* Some formatted card hasn't MBR, only DBR */
-		if (mbr_dpt == NULL) {
-			boot_sect_buf = mbr_buf;
-			mbr_buf = NULL;
-			boot_sector = (struct boot_sector *)boot_sect_buf;
-		} else {
-			lseek(h_sd_dev, mbr_dpt->rel_sectors * SECTOR_SIZE,
-					SEEK_SET);
-			boot_sect_buf = (char*)malloc(SEC_TO_BYTE(1));
-			if (boot_sect_buf == NULL) {
-				exitcode = errno;
-				goto end;
-			}
-			if (read(h_sd_dev, boot_sect_buf, SEC_TO_BYTE(1)) !=
-					SEC_TO_BYTE(1)) {
-				exitcode = errno;
-				printf(MSG_READ_FILE_FAIL, p_devname);
-				goto end;
-			}
-			debug("Read DBR from SDCard:\n");
-			print_buf(boot_sect_buf, SEC_TO_BYTE(1), 1);
-
-			boot_sector = (struct boot_sector *)boot_sect_buf;
-			if (endian_mode == BIG_ENDIAN_MODE)
-				swap_dbr(boot_sector);
+		mbr_dpt_base = parse_mbr(mbr_buf);
+		mbr_dpt = NULL;
+		mbr_dpt_last = NULL;
+		if (mbr_dpt_base) {
+			first_last_partition_on_disk(h_sd_dev, &geometry, mbr_dpt_base, &mbr_dpt, &mbr_dpt_last);
+			debug((mbr_dpt) ? "Found first partition in MBR\n" : "No valid first partition set up in MBR\n");
+			debug((mbr_dpt_last && mbr_dpt != mbr_dpt_last) ? "Found last partition in MBR\n" : "First partition seems to be also the last partition\n");
+			if(mbr_dpt)
+				print_mbr(mbr_dpt);
 		}
 
-		/* Parse partition. NOTE: mbr_dpt maybe always be NULL */
-		if (parse_dbr(boot_sector) != 0) {
-			exitcode = EINVAL;
-			printf(MSG_SIGNATURE_FAIL);
-			goto end;
+		if (!mbr_dpt) {
+			if (get_endian_mode() == BIG_ENDIAN_MODE)
+				swap_mbr((struct mbr_disk_part_tbl *)mbr_buf);
+		}
+
+		/* Some formatted card doesn't have an MBR, only DBR */
+		if (!mbr_dpt_base) {
+			boot_sect_buf = mbr_buf;
+			mbr_buf = NULL;
+		} else {
+			if(mbr_dpt) {
+				boot_sect_buf = (uchar*)malloc(SEC_TO_BYTE(1));
+				if (boot_sect_buf == NULL) {
+					exitcode = errno;
+					goto end;
+				}
+
+				rel_sectors = mbr_dpt->rel_sectors;
+				if(!read_sector(h_sd_dev, rel_sectors, boot_sect_buf)) {
+					exitcode = errno;
+					printf(MSG_READ_FILE_FAIL, p_devname);
+					goto end;
+				}
+				debug("Read DBR from SDCard at sector %u for partition size of %u sectors:\n", mbr_dpt->rel_sectors, mbr_dpt->total_sectors);
+				print_buf(boot_sect_buf, SEC_TO_BYTE(1), 1);
+			} else {
+				debug("No partition or disk boot record found, treating disk as unformatted/raw\n");
+			}
+		}
+
+		/* Parse first partition. NOTE: mbr_dpt maybe always be NULL */
+		if(boot_sect_buf) {
+			if (endian_mode == BIG_ENDIAN_MODE)
+				swap_dbr((struct boot_sector *)boot_sect_buf);
+			boot_sector = parse_dbr(mbr_dpt, boot_sect_buf);
+			if(!boot_sector)
+				if (endian_mode == BIG_ENDIAN_MODE)
+					swap_dbr((struct boot_sector *)boot_sect_buf);
 		}
 	} else {
 		h_spi_dev = open(p_devname, O_WRONLY|O_CREAT|O_TRUNC, 0666);
@@ -550,108 +883,109 @@ int main(int argc, char *argv[])
 	}
 
 	/* Open config file */
-	h_config = open(p_configname, O_RDONLY);
-	if (h_config < 0) {
-		exitcode = errno;
-		printf(MSG_OPEN_FILE_FAIL, p_configname);
+	exitcode = read_config_file(p_configname, pconfig_word, &config_num);
+	if (exitcode)
 		goto end;
-	}
 
-	len = lseek(h_config, 0, SEEK_END);
-	lseek(h_config, 0, SEEK_SET);
-	cfg_data_buf = malloc(len);
-	if (cfg_data_buf == NULL) {
-		exitcode = errno;
-		goto end;
-	}
-
-	if (read(h_config, cfg_data_buf, len) != len) {
-		exitcode = errno;
-		printf(MSG_READ_FILE_FAIL, p_configname);
-		goto end;
-	}
-
-	/* Parse config file */
-	config_num = parse_config_file(cfg_data_buf, len, pconfig_word);
-
-#if CONFIG_REV_SPACE
-	optind = 0;
-	while((opt = getopt_long_only(argc, argv, "", longopts, NULL)) != -1) {
-		if (opt == 'r')
-			rev_space = strtoul(optarg, (char**)NULL, 10) * 1024;
-	}
-#endif
-
-	/* Open user code file */
-	h_usercode = open(p_usercodename, O_RDONLY);
-	if (h_usercode < 0) {
-		exitcode = errno;
-		printf(MSG_OPEN_FILE_FAIL, p_usercodename);
-		goto end;
-	}
-
-	n = lseek(h_usercode, 0, SEEK_END);
-	lseek(h_usercode, 0, SEEK_SET);
-	len = (n + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1);
-	usercode_buf = malloc(len);
-	if (usercode_buf == NULL) {
-		exitcode = errno;
-		goto end;
-	}
-	if (read(h_usercode, usercode_buf, n) != n) {
-		exitcode = errno;
-		printf(MSG_READ_FILE_FAIL, p_usercodename);
-		goto end;
-	}
-
-	/* User code + Reserved space */
-	len += rev_space;
-	sec_user = len / SECTOR_SIZE;
+	/* Sanity check for PBL vs. non-PBL boot */
+	pblboot = true;
 	for (i = 0; i < config_num; i++) {
-		if (pconfig_word[i]->off == BOOT_IMAGE_LEN_OFF) {
-			/* The length must align sector size */
-			pconfig_word[i]->val = len;
-			break;
+		offmin = min(pconfig_word[i]->off, offmin);
+		offmax = max(pconfig_word[i]->off, offmax);
+		if ((pconfig_word[i]->off == BOOT_SIGNATURE_OFF) &&
+		    (pconfig_word[i]->val == BOOT_SIGNATURE)) {
+			pblboot = false;
 		}
 	}
 
+	debug((pblboot) ? "Configuration file is for a PBL boot\n" : "Configuration file is for a non-PBL boot\n");
+
+	if (!pblboot) {
+		if (offmin < BOOT_SIGNATURE_OFF) {
+			printf("WARNING! First config word prior to boot signature!\n");
+		}
+		if (offmax > BOOT_SIGNATURE_OFF + 4*BOOT_MAX_CONFIG_WORDS) {
+			printf("WARNING! Last config word past maximum permitted range!\n");
+		}
+		if (offmax >= 0x80 + 40 * 8) {
+			if (mbr_dpt) 
+				printf("WARNING! Config words conflict with FAT MBR usage!\n");
+			if (!mbr_dpt && boot_sector) 
+				printf("WARNING! We are overwriting a FAT style volume boot record!\n");
+		}
+	}
+
+
+	/* Open user code file */
+	exitcode = read_usercode_file(p_usercodename, &usercode_buf, &len);
+	if (exitcode)
+		goto end;
+
+	
+	/* User code + Reserved space */
+	len = BYTE_ROUNDUP_TO_SEC(len);
+	len += BYTE_ROUNDUP_TO_SEC(rev_space);
+
+	debug("Updating boot image length to %u in configuration data\n", len);
+	sec_user = BYTE_TO_SEC(len);
+	for (i = 0; i < config_num; i++) {
+		if (pconfig_word[i]->off == BOOT_IMAGE_LEN_OFF) {
+			/* The length must be aligned to the sector size */
+			pconfig_word[i]->val = len;
+			//break; Changed to deal with complex copy/paste configs
+		}
+	}
+
+	// User code has to start beyond the config words, and we always start at least
+	// at block two to be backwards compatible
+	n = BYTE_TO_SEC(offmax + 3) + 1;
+	if(n < 2)
+		n = 2;
+
 	if (work_mode == BOOT_WORK_MODE_SD) {
+		// We mess with partitions only if our code does not fit into the available space
+		// prior to the first partition
+
 		/* FIXME: don't support disk clean up */
-		n = adjust_partition_table(mbr_dpt, boot_sector,
-				sec_user, &h_cap);
-        rel_sectors = mbr_dpt->rel_sectors;
-    } else {
-		h_cap = 0;
-		n = 2; /* Start address of user code in SPI mode,  */
+		if(mbr_dpt || boot_sector) {
+			debug("Checking if FAT partition needs to be shrinked\n");
+			n = adjust_partition_table(&geometry, sd_sectors, mbr_dpt, mbr_dpt_last, boot_sector,
+						   n, sec_user);
+			rel_sectors = mbr_dpt->rel_sectors;
+		}
 	}
 
 	if (n == (uint)-1) {
-		exitcode = EINVAL;
 		printf(MSG_PARTLENGTH_FAIL);
+		exitcode = EINVAL;
 		goto end;
 	}
 
-    /* Change config word[0x50] to final user code position
-     * JZ: Source address should be always byte mode*/
+	/* Change config word[0x50] to final user code position
+	 * JZ: Source address should be always byte mode*/
 	for (i = 0; i < config_num; i++) {
 		if (pconfig_word[i]->off == BOOT_IMAGE_ADDR_OFF) {
 			code_addr = i;
-            pconfig_word[i]->val = n * SECTOR_SIZE;
+			pconfig_word[i]->val = SEC_TO_BYTE_OFFSET(n);
 			break;
 		}
 	}
 
+	if (code_addr < 0) {
+		printf(MSG_PARTLENGTH_FAIL);
+		exitcode = EINVAL;
+		goto end;
+	}
+
 	/* Only in SD mode config file is supported to output */
-	optind = 0;
 	if (work_mode == BOOT_WORK_MODE_SD) {
-		while((opt = getopt_long_only(argc, argv, "", longopts, NULL))
-			!= -1) {
-			if (opt == 'o')
-				if (write_config_file(optarg, config_num,
-						      pconfig_word)) {
-					exitcode = errno;
-					goto end;
-				}
+		if (p_outconfigname[0]) {
+			debug("Writing configuration file ...\n");
+			if(write_config_file(p_outconfigname, config_num,
+			                     pconfig_word)) {
+				exitcode = errno;
+				goto end;
+			}
 		}
 	}
 
@@ -665,128 +999,114 @@ int main(int argc, char *argv[])
 	else
 		h_dev = h_spi_dev;
 
-	/* Write user code to sd card */
-	debug("\nWriting image to %s...",
-		(work_mode == BOOT_WORK_MODE_SD) ? "SDCard" : "SPI image");
-	if (h_cap)
-		/*
-		 * For high-capacity card, the byte offset maybe beyond
-		 * 0xffffffff, so it has to move step by step
-         * JZ: The source address is byte mode now.
-		 */
-        lseek64(h_dev, (off64_t)pconfig_word[code_addr]->val,
-				SEEK_SET);
-	else
-		lseek(h_dev, pconfig_word[code_addr]->val, SEEK_SET);
-
-	len = SEC_TO_BYTE(sec_user) - rev_space;
-	ptr = (uchar *)usercode_buf;
-	while (len > 0) {
-		n = write(h_dev, ptr, len);
-		if (n < 0) {
-			exitcode = errno;
-			printf(MSG_WRITE_FILE_FAIL, p_devname);
-			goto end;
+	if (h_dev) {
+		/* Write user code to sd card */
+		debug("\nWriting image to %s...",
+			(work_mode == BOOT_WORK_MODE_SD) ? "SDCard" : "SPI image");
+		if(lseek(h_dev, pconfig_word[code_addr]->val, SEEK_SET) < 0) {
+			goto writefail;
 		}
-		ptr += n;
-		len -= n;
-	}
-	debug("OK.\n");
 
-	if ((work_mode == BOOT_WORK_MODE_SPI)&& (rev_space != 0)) {
-		/* Extend file size to accomodate reserved space */
-		lseek(h_dev, rev_space - 1, SEEK_CUR);
-		write(h_dev, &n, 1);
-	}
-
-	lseek(h_dev, 0, SEEK_SET);
-	if (work_mode == BOOT_WORK_MODE_SD) {
-		/* Write config words to sd card in proper byte endian */
-		debug("\nWriting config words to MBR's buffer first...");
-		ptr = (uchar *)mbr_buf;
-		if (ptr == NULL)
-			ptr = (uchar *)boot_sect_buf;
-
-		for (i = 0; i < config_num; i++) {
-			n = pconfig_word[i]->val;
-			/* Config words are provided with big endian mode */
-			if (endian_mode == LITTLE_ENDIAN_MODE)
-				n = SWAP32(n);
-			*(int *)(ptr + pconfig_word[i]->off) = n;
+		len = SEC_TO_BYTE(sec_user) - BYTE_ROUNDUP_TO_SEC(rev_space);
+		ptr = (uchar *)usercode_buf;
+		if (writebuffer(h_dev, ptr, len)) {
+			goto writefail;
 		}
+			
+		if ((work_mode == BOOT_WORK_MODE_SPI) && (rev_space != 0)) {
+			/* Extend file size to accomodate reserved space */
+			if(lseek(h_dev, rev_space - 1, SEEK_CUR) < 0) {
+				goto writefail;
+			}
+			n = 0;
+			if(write(h_dev, &n, 1) != 1) {
+				goto writefail;
+			}
+		}
+
 		debug("OK.\n");
+	}
 
+	if (work_mode == BOOT_WORK_MODE_SD) {
 		/* Write MBR */
-		debug("\nWriting MBR to SDCard...");
-		len = SEC_TO_BYTE(1);
 		if (mbr_buf) {
-			ptr = (uchar *)(mbr_buf + MBR_DPT_OFF);
+			debug("\nWriting MBR to SDCard...");
 			if (endian_mode == BIG_ENDIAN_MODE)
 				swap_mbr((struct mbr_disk_part_tbl *)ptr);
-			print_mbr((struct mbr_disk_part_tbl *)ptr);
 
 			ptr = (uchar *)mbr_buf;
 			print_buf(ptr, SEC_TO_BYTE(1), 1);
-			while (len > 0) {
-				n = write(h_dev, ptr, len);
-				if (n < 0) {
-					exitcode = errno;
-					printf(MSG_WRITE_FILE_FAIL, p_devname);
-				}
-				ptr += n;
-				len -= n;
+			if (!write_sector(h_dev, 0, ptr)) {
+				goto writefail;
 			}
-			lseek(h_dev, rel_sectors * SECTOR_SIZE,	SEEK_SET);
 		}
 		debug("OK.\n");
 
 		/* Write DBR */
-		debug("\nWriting DBR to SDCard...");
-		len = SEC_TO_BYTE(1);
 		if (boot_sect_buf) {
+			debug("\nWriting DBR to SDCard...");
 			if (endian_mode == BIG_ENDIAN_MODE)
 				swap_dbr((struct boot_sector *)boot_sect_buf);
 			print_dbr((struct boot_sector *)boot_sect_buf);
 
 			ptr = (uchar *)boot_sect_buf;
 			print_buf(ptr, SEC_TO_BYTE(1), 1);
-			while (len > 0) {
-				n = write(h_dev, ptr, len);
-				if (n < 0) {
-					exitcode = errno;
-					printf(MSG_WRITE_FILE_FAIL, p_devname);
-				}
-				ptr += n;
-				len -= n;
+			if (!write_sector(h_dev, rel_sectors, ptr)) {
+				goto writefail;
 			}
 		}
 		debug("OK.\n");
-	} else {
-		uchar sector[SECTOR_SIZE];
+	}
 
-		memset(sector, 0, SECTOR_SIZE);
+	// Now it's time to finally update the image with our
+	// config words. We read/update/write the sectors as needed
+	{
+		uchar sector[SECTOR_SIZE];
+		uint secnum = 0xffffffff, newsecnum;
+
+		debug("Updating configuration words in target image ...\n");
 		for (i = 0; i < config_num; i++) {
 			n = pconfig_word[i]->val;
 			/* Config words are provided with big endian mode */
 			if (endian_mode == LITTLE_ENDIAN_MODE)
 				n = SWAP32(n);
-			*(int *)(sector + pconfig_word[i]->off) = n;
-		}
+			newsecnum = BYTE_TO_SEC(pconfig_word[i]->off);
+			if(secnum != newsecnum) {
+				if(secnum != 0xffffffff) {
+					debug("Writing sector %u\n", secnum);
+					if (!write_sector(h_dev, secnum, sector)) {
+writefail:
+						exitcode = errno;
+						printf(MSG_WRITE_FILE_FAIL, p_devname);
+						goto end;
+					}
+				}
 
-		debug("\nWriting config words to SPI image...");
-		len = SEC_TO_BYTE(1);
-		while (len > 0) {
-			ptr = (uchar *)sector;
-			n = write(h_dev, ptr, len);
-			if (n < 0) {
-				exitcode = errno;
-				printf(MSG_WRITE_FILE_FAIL, p_devname);
+				if (work_mode == BOOT_WORK_MODE_SD) {
+					debug("Reading sector %u\n", newsecnum);
+					if(!read_sector(h_dev, newsecnum, sector)) {
+						exitcode = errno;
+						printf(MSG_READ_FILE_FAIL, p_devname);
+						goto end;
+					}
+				} else {
+					memset(sector, 0, SECTOR_SIZE);
+				}
+
+				secnum = newsecnum;
 			}
-			ptr += n;
-			len -= n;
+			*(uint *)(sector + pconfig_word[i]->off) = n;
+		}
+		if(secnum != 0xffffffff) {
+			debug("Writing sector %u\n", secnum);
+			if (!write_sector(h_dev, secnum, sector)) {
+				goto writefail;
+			}
 		}
 		debug("OK.\n");
 	}
+
+
 	sync();
 
 end:
@@ -794,22 +1114,20 @@ end:
 		free(pconfig_word[i]);
 	free(boot_sect_buf);
 	free(mbr_buf);
-	free(cfg_data_buf);
 	free(usercode_buf);
-	if (h_usercode != 0)
-		close(h_usercode);
-	if (h_config != 0)
-		close(h_config);
 	if (h_sd_dev != 0)
 		close(h_sd_dev);
 	if (h_spi_dev != 0)
 		close(h_spi_dev);
 
 	if (exitcode == 0) {
-		printf("Congratulations! It is done successfully.\n");
-		return EXIT_SUCCESS;
+		printf("Congratulations! Completed successfully.\n");
+		exitcode = EXIT_SUCCESS;
+	} else {
+		printf("Error happened while execution: %s\n", strerror(exitcode));
+		exitcode = EXIT_FAILURE;
 	}
 
-	printf("Error happened while execution: %s\n", strerror(exitcode));
-	return EXIT_FAILURE;
+	return exitcode;
 }
+

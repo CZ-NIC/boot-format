@@ -3,7 +3,11 @@
 INSTALL=install
 PREFIX=/usr
 
+CFLAGS=-Wall
+
 all: boot_format
+
+boot_format.o: boot_format.c boot_format.h
 
 boot_format: boot_format.o
 	$(CC) $< -o $@

@@ -35,7 +35,7 @@
  *
  * This application implements writing the bootup code to MMC/SD cards.
  *
- * It contains
+ * The structure for non-PBL devices, e.g., P2020 contains:
  *  Offset     Data Bits [0:31]
  * 0x00-0x3F   Reserved
  * 0x40-0x43   BOOT signature. This location should contain the value 0x424f_4f54,
@@ -48,17 +48,21 @@
  *             Capacity SD/MMC Cards, it specifies the memory address in byte
  *             address format. This must be a multiple of the SD/MMC cards block
  *             size. In High Capacity SD/MMC Cards (>2GByte), the Address specifies
- *             the memory address in block address format. Block length is fixed
- *             to 512 bytes as per the SD High Capacity specification.
+ *             the memory address also in byte address format in multiples of block
+ *             length. Block length is fixed to 512 bytes as per the SD High Capacity
+ *             specification.
  * 0x54-0x57   Reserved
  * 0x58-0x5B   Target Address. Contains the target address in the system's local
  *             memory address space in which the user's code will be copied to.
+ *             This is a 32b address always pointing into the first 4GB.
  * 0x5C-0x5F   Reserved
  * 0x60-0x63   Execution Starting Address. Contains the jump address in the
  *             system's local memory address space into the user's code first
- *             instruction to be executed.
+ *             instruction to be executed. This is a 32b address always pointing
+ *             into the first 4GB.
  * 0x64-0x67   Reserved
  * 0x68-0x6B   N. Number of Configuration Address/Data pairs. Must be 1<=N<=1024
+ * 	       but is recommended to be as small as possible
  * 0x6C-0x7F   Reserved
  * 0x80-0x83   Configuration Address 1
  * 0x84-0x87   Configuration Data 1
@@ -70,7 +74,8 @@
  * ...
  * User's Code
  *
- * NOTE: N <= 40 (Offset can be from first page up to 24th page in a 512 block)
+ * NOTE: N <= 40 is a must for FAT compatibility
+ *       (Offset can be from first page up to 24th page in a 512 block)
  */
 
 #ifdef DEBUG
@@ -79,21 +84,26 @@
 	#define debug(fmt, arg...)
 #endif
 
+#define BOOT_SIGNATURE_OFF	0x40
+#define BOOT_SIGNATURE		0x424f4f54
 #define BOOT_IMAGE_LEN_OFF	0x48
 #define BOOT_IMAGE_ADDR_OFF	0x50
-#define BOOT_MAX_CONFIG_WORDS   64
+
+#define BOOT_MAX_CONFIG_WORDS   (16+1024*2)
 
 #define BOOT_WORK_MODE_SD	0x1
 #define BOOT_WORK_MODE_SPI	0x2
-#define BOOT_REV_SPACE		0	/* Reserve spave for Env variabls */
+#define BOOT_REV_SPACE		0	/* Reserve spave for Env variables */
 
 #define MBR_DPT_OFF	0x1be
+#define MBRDBR_BOOT_SIG_55	0x1fe
+#define MBRDBR_BOOT_SIG_AA	0x1ff
+
 #define SECTOR_SIZE	512
-#define SEC_TO_BYTE(x)	((x) * SECTOR_SIZE)
-#define FSTYPE_FAT16	0
-#define FSTYPE_FAT32	1
-#define FAT32_BOUNDARYUNIT   8192
-#define EXFAT_BOUNDARYUNIT   32768
+#define SEC_TO_BYTE(x)		((x) * SECTOR_SIZE)
+#define SEC_TO_BYTE_OFFSET(x)	((x) * SECTOR_SIZE)
+#define BYTE_ROUNDUP_TO_SEC(x)	(((x) + SECTOR_SIZE - 1) & ~(SECTOR_SIZE - 1))
+#define BYTE_TO_SEC(x)		((x) / SECTOR_SIZE)
 
 #define LITTLE_ENDIAN_MODE	0
 #define BIG_ENDIAN_MODE		1
@@ -102,24 +112,27 @@
 #define ushort	unsigned short
 #define uint	unsigned int
 
-#define MSG_OPEN_FILE_FAIL "Fail to open file \"%s\". Pls check whether it " \
+#define MSG_MEMALLOC_FAIL  "Failed to allocate memory for \"%s\"\n"
+
+#define MSG_OPEN_FILE_FAIL "Failed to open file \"%s\". Please check whether it " \
 			   "exists and verify your permission.\n"
 
-#define MSG_READ_FILE_FAIL "Fail to read file \"%s\". Pls check whether it " \
+#define MSG_GEOMETRY_FAIL  "Failed to obtain disk geometry for \"%s\". Please check whether it " \
+			   "exists as block device and verify your permission.\n"
+
+#define MSG_READ_FILE_FAIL "Failed to read file \"%s\". Please check whether it " \
 			   "exists and verify your read permission.\n"
 
-#define MSG_WRITE_FILE_FAIL "Fail to write file \"%s\". Pls check whether it "\
+#define MSG_WRITE_FILE_FAIL "Failed to write file \"%s\". Please check whether it "\
 			    "exists and verify your write permission.\n"
 
-#define MSG_SIGNATURE_FAIL "Fail to find MBR/DBR. Pls check whether the card "\
+#define MSG_SIGNATURE_FAIL "Failed to find MBR or partition boot block. Please check whether the card "\
 			    "is formatted correctly\n"
 
 #define MSG_PARTLENGTH_FAIL "Partition is too small to save the user code. "\
-			    "Pls re-partition it again\n"
+			    "Please re-partition it again\n"
 
 #define DELIMITER	':'
-#define RET_FLG1	'\r'
-#define RET_FLG2	'\n'
 
 #define SWAP16(x) ((((x) & 0x00ff) << 8) | (((x) & 0xff00) >> 8))
 
@@ -127,6 +140,10 @@
 		   (((x) & 0x0000ff00) << 8)  | \
 		   (((x) & 0x00ff0000) >> 8)  | \
 		   (((x) & 0xff000000) >> 24))
+
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
+
 
 struct config_word {
 	uint off; /* if off = 0 means config word ends */
